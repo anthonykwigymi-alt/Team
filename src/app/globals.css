@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background-color: #09090b;
+  color: #fafafa;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv11", "ss01";
+}
+
+::selection {
+  background: #d4ff00;
+  color: #000;
+}
+
+input::placeholder {
+  color: #52525b;
+}
+
+:focus-visible {
+  outline: 1px solid #d4ff00;
+  outline-offset: 2px;
+}
+
+/* Minimal dark scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #09090b;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 9999px;
+}
+
+/* Hide scrollbar on horizontal chip rows */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
