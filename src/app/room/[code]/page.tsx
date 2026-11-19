@@ -6,6 +6,10 @@ import Link from "next/link";
 import {
   Copy,
   Check,
+  Share2,
+  QrCode,
+  X,
+  Trash2,
   ArrowLeft,
   RotateCcw,
   Dices,
@@ -20,10 +24,14 @@ import {
   Vote,
   VotePoints,
   getRoomBundleByCode,
-  fetchVotesForRoom,
+  fetchRoomLiveState,
   castOptionVote,
+  persistRoomWinner,
+  deleteRoomOption,
+  isHostForRoom,
   subscribeToRoomRealtime,
 } from "@/lib/supabase";
+import { generateQrMatrix } from "@/lib/qrCode";
 
 const DISPLAY_NAME_STORAGE_KEY = "decide_for_us_display_name";
 
@@ -46,6 +54,7 @@ export default function RoomVotingPage() {
   const [options, setOptions] = useState<RoomOption[]>([]);
   const [votes, setVotes] = useState<Vote[]>([]);
   const [mode, setMode] = useState<"supabase" | "local">("supabase");
+  const [isHost, setIsHost] = useState<boolean>(false);
 
   // Display Name state (persisted in localStorage)
   const [displayName, setDisplayName] = useState<string>("");
@@ -54,20 +63,41 @@ export default function RoomVotingPage() {
 
   // Card-by-card voting state
   const [currentCardIndex, setCurrentCardIndex] = useState<number>(0);
-  const [userSelections, setUserSelections] = useState<Record<string, VotePoints>>({});
   const [isSubmittingVote, setIsSubmittingVote] = useState<boolean>(false);
   const [hasFinishedVoting, setHasFinishedVoting] = useState<boolean>(false);
 
-  // Copy Invite Link state
+  // Share, Toast & QR Modal state
   const [copied, setCopied] = useState<boolean>(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [isQrModalOpen, setIsQrModalOpen] = useState<boolean>(false);
+  const [roomUrl, setRoomUrl] = useState<string>("");
 
-  // Tie-breaker state
-  const [tieBreakerWinnerId, setTieBreakerWinnerId] = useState<string | null>(null);
-  const [isSpinningTieBreaker, setIsSpinningTieBreaker] = useState<boolean>(false);
+  // Synced Tie-breaker / Final Winner state
+  const [syncedWinnerId, setSyncedWinnerId] = useState<string | null>(null);
+  const [rouletteHighlightId, setRouletteHighlightId] = useState<string | null>(
+    null
+  );
+  const [isSpinningTieBreaker, setIsSpinningTieBreaker] =
+    useState<boolean>(false);
+  const [deletingOptionId, setDeletingOptionId] = useState<string | null>(null);
 
-  // Load saved Display Name from localStorage on mount
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+  }, []);
+
+  useEffect(() => {
+    if (!toastMessage) return;
+    const timer = setTimeout(() => setToastMessage(null), 2600);
+    return () => clearTimeout(timer);
+  }, [toastMessage]);
+
+  // Load saved Display Name & Host status from localStorage on mount
   useEffect(() => {
     if (typeof window === "undefined") return;
+    setRoomUrl(window.location.href);
+    if (roomCode) {
+      setIsHost(isHostForRoom(roomCode));
+    }
     const saved = window.localStorage.getItem(DISPLAY_NAME_STORAGE_KEY);
     if (saved && saved.trim()) {
       const cleaned = saved.trim();
@@ -75,9 +105,9 @@ export default function RoomVotingPage() {
       setNameInput(cleaned);
       setIsNameConfirmed(true);
     }
-  }, []);
+  }, [roomCode]);
 
-  // Load Room, Options, and Votes
+  // Load Room, Options, Votes, and Synced Winner
   const loadRoomData = useCallback(async () => {
     if (!roomCode) return;
     setLoading(true);
@@ -91,6 +121,7 @@ export default function RoomVotingPage() {
     setRoom(bundle.room);
     setOptions(bundle.options);
     setVotes(bundle.votes);
+    setSyncedWinnerId(bundle.winnerOptionId);
     setMode(bundle.mode);
     setLoading(false);
   }, [roomCode]);
@@ -99,7 +130,7 @@ export default function RoomVotingPage() {
     loadRoomData();
   }, [loadRoomData]);
 
-  // Check if the current user has already voted on all options in this room
+  // Check if the current user has already voted on all active options in this room
   useEffect(() => {
     if (!isNameConfirmed || !displayName || options.length === 0) return;
 
@@ -108,48 +139,84 @@ export default function RoomVotingPage() {
     );
 
     if (myVotes.length >= options.length) {
-      const map: Record<string, VotePoints> = {};
-      myVotes.forEach((v) => {
-        map[v.option_id] = v.points;
-      });
-      setUserSelections(map);
       setHasFinishedVoting(true);
     }
   }, [isNameConfirmed, displayName, options.length, votes]);
 
-  // Subscribe to Realtime vote updates
+  // Keep currentCardIndex within bounds if host deletes an option
+  useEffect(() => {
+    if (options.length > 0 && currentCardIndex >= options.length) {
+      setCurrentCardIndex(options.length - 1);
+    }
+  }, [options.length, currentCardIndex]);
+
+  // Subscribe to Realtime updates (votes, option deletions, synced winner decisions)
   useEffect(() => {
     if (!room?.id) return;
 
-    const refreshVotes = async () => {
-      const latestVotes = await fetchVotesForRoom(room.id, mode);
-      setVotes(latestVotes);
+    const refreshLiveState = async () => {
+      const latest = await fetchRoomLiveState(room.id, mode);
+      if (latest) {
+        setOptions(latest.options);
+        setVotes(latest.votes);
+        setSyncedWinnerId(latest.winnerOptionId);
+      }
     };
 
-    const unsubscribe = subscribeToRoomRealtime(room.id, refreshVotes);
+    const unsubscribe = subscribeToRoomRealtime(room.id, refreshLiveState);
     return () => {
       unsubscribe();
     };
   }, [room?.id, mode]);
 
-  const handleCopyInviteLink = async () => {
+  const copyUrlToClipboard = async () => {
     if (typeof window === "undefined") return;
     const url = window.location.href;
     try {
       await navigator.clipboard.writeText(url);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2500);
     } catch {
-      // Fallback copy
       const input = document.createElement("input");
       input.value = url;
       document.body.appendChild(input);
       input.select();
       document.execCommand("copy");
       document.body.removeChild(input);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2500);
     }
+    setCopied(true);
+    showToast("Invite link copied to clipboard");
+    setTimeout(() => setCopied(false), 2500);
+  };
+
+  const handleShareInvite = async () => {
+    if (typeof window === "undefined") return;
+    const url = window.location.href;
+    const isMobileDevice =
+      /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+      (typeof window.matchMedia === "function" &&
+        window.matchMedia("(pointer: coarse)").matches &&
+        window.innerWidth < 768);
+
+    if (
+      isMobileDevice &&
+      typeof navigator.share === "function" &&
+      room
+    ) {
+      try {
+        await navigator.share({
+          title: `Decide For Us: ${room.title}`,
+          text: `Vote on "${room.title}" (${room.code})`,
+          url,
+        });
+        showToast("Shared invite link");
+        return;
+      } catch (err: unknown) {
+        if (err instanceof Error && err.name === "AbortError") {
+          return;
+        }
+      }
+    }
+
+    await copyUrlToClipboard();
   };
 
   const handleConfirmDisplayName = (e: React.FormEvent) => {
@@ -162,13 +229,11 @@ export default function RoomVotingPage() {
       window.localStorage.setItem(DISPLAY_NAME_STORAGE_KEY, cleaned);
     }
 
-    // Reset voting progress for this voter if they haven't voted yet
     const existingForVoter = votes.filter(
       (v) => v.voter_name.toLowerCase() === cleaned.toLowerCase()
     );
     if (existingForVoter.length < options.length) {
       setCurrentCardIndex(0);
-      setUserSelections({});
       setHasFinishedVoting(false);
     }
   };
@@ -178,7 +243,6 @@ export default function RoomVotingPage() {
     setNameInput("");
     setDisplayName("");
     setCurrentCardIndex(0);
-    setUserSelections({});
     setHasFinishedVoting(false);
   };
 
@@ -188,10 +252,6 @@ export default function RoomVotingPage() {
     if (!currentOption) return;
 
     setIsSubmittingVote(true);
-    setUserSelections((prev) => ({
-      ...prev,
-      [currentOption.id]: points,
-    }));
 
     try {
       const savedVote = await castOptionVote({
@@ -202,7 +262,6 @@ export default function RoomVotingPage() {
         mode,
       });
 
-      // Optimistically merge vote into local state
       setVotes((prev) => {
         const filtered = prev.filter(
           (v) =>
@@ -221,6 +280,35 @@ export default function RoomVotingPage() {
       }
     } finally {
       setIsSubmittingVote(false);
+    }
+  };
+
+  // Host Option Cleanup handler
+  const handleHostDeleteOption = async (optionToDelete: RoomOption) => {
+    if (!room || !isHost || deletingOptionId) return;
+    if (options.length <= 2) {
+      showToast("A room must keep at least 2 options");
+      return;
+    }
+
+    setDeletingOptionId(optionToDelete.id);
+    try {
+      await deleteRoomOption({
+        roomId: room.id,
+        optionId: optionToDelete.id,
+        mode,
+      });
+
+      setOptions((prev) => prev.filter((o) => o.id !== optionToDelete.id));
+      setVotes((prev) =>
+        prev.filter((v) => v.option_id !== optionToDelete.id)
+      );
+      if (syncedWinnerId === optionToDelete.id) {
+        setSyncedWinnerId(null);
+      }
+      showToast(`Removed "${optionToDelete.label}"`);
+    } finally {
+      setDeletingOptionId(null);
     }
   };
 
@@ -276,31 +364,66 @@ export default function RoomVotingPage() {
     () =>
       topScore > 0
         ? leaderboard.filter((entry) => entry.totalPoints === topScore)
-        : [],
+        : leaderboard,
     [leaderboard, topScore]
   );
 
-  const handleRunTieBreaker = () => {
-    if (tiedLeaders.length < 2 || isSpinningTieBreaker) return;
+  // Active winner option ID (during roulette animation or persisted synced winner)
+  const activeWinnerOptionId = rouletteHighlightId || syncedWinnerId;
+  const decidedWinnerEntry = useMemo(
+    () =>
+      syncedWinnerId
+        ? leaderboard.find((e) => e.option.id === syncedWinnerId) || null
+        : null,
+    [leaderboard, syncedWinnerId]
+  );
+
+  // Synced Tie-Breaker & Winner Reveal roulette animation + database persistence
+  const handleRunTieBreakerOrPickWinner = () => {
+    if (!room || isSpinningTieBreaker || leaderboard.length === 0) return;
+
+    // Candidate pool: top tied options if there is a tie, or all options with top score / top contenders
+    const candidatePool =
+      tiedLeaders.length >= 2 ? tiedLeaders : leaderboard;
+
     setIsSpinningTieBreaker(true);
-    setTieBreakerWinnerId(null);
 
     let ticks = 0;
-    const maxTicks = 14;
-    const interval = setInterval(() => {
-      const randomEntry =
-        tiedLeaders[Math.floor(Math.random() * tiedLeaders.length)];
-      setTieBreakerWinnerId(randomEntry.option.id);
+    const maxTicks = 16;
+    const interval = setInterval(async () => {
+      const cycleEntry =
+        candidatePool[ticks % candidatePool.length] ||
+        candidatePool[Math.floor(Math.random() * candidatePool.length)];
+      setRouletteHighlightId(cycleEntry.option.id);
       ticks++;
+
       if (ticks >= maxTicks) {
         clearInterval(interval);
         const finalWinner =
-          tiedLeaders[Math.floor(Math.random() * tiedLeaders.length)];
-        setTieBreakerWinnerId(finalWinner.option.id);
+          candidatePool[Math.floor(Math.random() * candidatePool.length)];
+        setRouletteHighlightId(null);
+        setSyncedWinnerId(finalWinner.option.id);
         setIsSpinningTieBreaker(false);
+
+        await persistRoomWinner({
+          roomId: room.id,
+          optionId: finalWinner.option.id,
+          mode,
+        });
+        showToast(`Final decision: ${finalWinner.option.label}`);
       }
-    }, 110);
+    }, 95);
   };
+
+  // QR Matrix memoized for current room URL
+  const qrMatrix = useMemo(() => {
+    const targetUrl =
+      roomUrl ||
+      (typeof window !== "undefined"
+        ? window.location.href
+        : `http://localhost:3000/room/${roomCode}`);
+    return generateQrMatrix(targetUrl);
+  }, [roomUrl, roomCode]);
 
   if (loading) {
     return (
@@ -353,9 +476,102 @@ export default function RoomVotingPage() {
     : 0;
 
   return (
-    <main className="mx-auto flex w-full max-w-md flex-1 flex-col px-4 pb-8 pt-4">
+    <main className="mx-auto flex w-full max-w-md flex-1 flex-col px-4 pb-10 pt-4">
+      {/* Toast Notification */}
+      {toastMessage && (
+        <div
+          role="status"
+          className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 animate-fade-in rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-2.5 text-xs font-medium text-ink shadow-2xl"
+        >
+          {toastMessage}
+        </div>
+      )}
+
+      {/* QR Code Modal */}
+      {isQrModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Room QR Code"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-4 backdrop-blur-sm"
+          onClick={() => setIsQrModalOpen(false)}
+        >
+          <div
+            className="w-full max-w-xs animate-fade-in rounded-xl border border-line bg-surface p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <div className="font-mono text-[11px] uppercase tracking-widest text-zinc-500">
+                  Scan to join
+                </div>
+                <div className="font-mono text-lg font-semibold tabular-nums tracking-widest text-ink">
+                  {room.code}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsQrModalOpen(false)}
+                aria-label="Close QR modal"
+                className="flex h-9 w-9 items-center justify-center rounded-lg border border-line text-zinc-400 transition-colors hover:border-zinc-600 hover:text-ink"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {/* Crisp Inline SVG QR Code */}
+            <div className="mx-auto flex aspect-square w-full max-w-[220px] items-center justify-center rounded-lg bg-white p-3.5">
+              <svg
+                viewBox={`0 0 ${qrMatrix.length} ${qrMatrix.length}`}
+                className="h-full w-full"
+                shapeRendering="crispEdges"
+                role="img"
+                aria-label={`QR code for room ${room.code}`}
+              >
+                {qrMatrix.map((row, rIdx) =>
+                  row.map((isDark, cIdx) =>
+                    isDark ? (
+                      <rect
+                        key={`${rIdx}-${cIdx}`}
+                        x={cIdx}
+                        y={rIdx}
+                        width={1}
+                        height={1}
+                        fill="#09090B"
+                      />
+                    ) : null
+                  )
+                )}
+              </svg>
+            </div>
+
+            <p className="mt-3 truncate text-center font-mono text-[11px] text-zinc-500">
+              {roomUrl}
+            </p>
+
+            <button
+              type="button"
+              onClick={copyUrlToClipboard}
+              className="mt-4 flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-accent text-sm font-semibold text-black transition-opacity hover:opacity-90"
+            >
+              {copied ? (
+                <>
+                  <Check className="h-4 w-4" />
+                  <span>Copied</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="h-4 w-4" />
+                  <span>Copy Room Link</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Top bar */}
-      <header className="mb-5 flex items-center justify-between gap-3">
+      <header className="mb-5 flex items-center justify-between gap-2">
         <Link
           href="/"
           className="inline-flex h-11 items-center gap-1.5 rounded-lg border border-line px-3 text-sm font-medium text-zinc-300 transition-colors hover:border-zinc-600 hover:text-ink"
@@ -364,38 +580,58 @@ export default function RoomVotingPage() {
           <span>New</span>
         </Link>
 
-        <button
-          type="button"
-          onClick={handleCopyInviteLink}
-          className={`inline-flex h-11 items-center gap-2 rounded-lg px-4 text-sm font-semibold transition-colors active:opacity-80 ${
-            copied
-              ? "border border-accent bg-transparent text-accent"
-              : "bg-ink text-black hover:bg-zinc-200"
-          }`}
-        >
-          {copied ? (
-            <>
-              <Check className="h-4 w-4" />
-              <span>Link copied</span>
-            </>
-          ) : (
-            <>
-              <Copy className="h-4 w-4" />
-              <span>Copy Invite Link</span>
-            </>
-          )}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setIsQrModalOpen(true)}
+            aria-label="Show Room QR Code"
+            title="Show QR Code"
+            className="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-line bg-surface text-zinc-200 transition-colors hover:border-zinc-600 hover:text-ink"
+          >
+            <QrCode className="h-4 w-4" />
+          </button>
+
+          <button
+            type="button"
+            onClick={handleShareInvite}
+            className={`inline-flex h-11 items-center gap-2 rounded-lg px-4 text-sm font-semibold transition-colors active:opacity-80 ${
+              copied
+                ? "border border-accent bg-transparent text-accent"
+                : "bg-ink text-black hover:bg-zinc-200"
+            }`}
+          >
+            {copied ? (
+              <>
+                <Check className="h-4 w-4" />
+                <span>Link copied</span>
+              </>
+            ) : (
+              <>
+                <Share2 className="h-4 w-4" />
+                <span>Share Invite</span>
+              </>
+            )}
+          </button>
+        </div>
       </header>
 
       {/* Room header */}
       <section className="mb-5 border-b border-line pb-5">
         <div className="mb-2 flex items-center justify-between font-mono text-xs tabular-nums text-zinc-500">
-          <span className="uppercase tracking-[0.2em] text-zinc-400">
-            Room {room.code}
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="uppercase tracking-[0.2em] text-zinc-400">
+              Room {room.code}
+            </span>
+            {isHost && (
+              <span className="rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-zinc-300">
+                Host
+              </span>
+            )}
+          </div>
           <span>
             {uniqueVoters.length}{" "}
-            {uniqueVoters.length === 1 ? "voter" : "voters"}
+            {uniqueVoters.length === 1 ? "voter" : "voters"} &middot;{" "}
+            {options.length} options
           </span>
         </div>
 
@@ -439,12 +675,12 @@ export default function RoomVotingPage() {
               value={nameInput}
               onChange={(e) => setNameInput(e.target.value)}
               placeholder="e.g., Alex"
-              className="h-12 w-full rounded-lg border border-line bg-canvas px-3 text-base text-ink outline-none transition-colors focus:border-zinc-500"
+              className="h-12 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 text-base text-white outline-none transition-colors placeholder:text-zinc-500 focus:border-zinc-500"
             />
             <button
               type="submit"
               disabled={!nameInput.trim()}
-              className="flex h-12 w-full items-center justify-center rounded-lg bg-accent text-[15px] font-semibold text-black transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+              className="flex h-12 w-full items-center justify-center rounded-lg bg-[#D4FF00] text-[15px] font-semibold text-black transition-colors hover:bg-[#c3eb00] disabled:cursor-not-allowed disabled:opacity-40"
             >
               Start Voting
             </button>
@@ -473,10 +709,24 @@ export default function RoomVotingPage() {
           </div>
 
           {/* Active card */}
-          <div className="my-6 flex min-h-[200px] flex-1 flex-col justify-center rounded-xl border border-line bg-surface p-6">
-            <span className="mb-3 font-mono text-xs uppercase tracking-[0.2em] text-zinc-500">
-              Option {String(currentCardIndex + 1).padStart(2, "0")}
-            </span>
+          <div className="relative my-6 flex min-h-[200px] flex-1 flex-col justify-center rounded-xl border border-line bg-surface p-6">
+            <div className="mb-3 flex items-center justify-between">
+              <span className="font-mono text-xs uppercase tracking-[0.2em] text-zinc-500">
+                Option {String(currentCardIndex + 1).padStart(2, "0")}
+              </span>
+              {isHost && options.length > 2 && (
+                <button
+                  type="button"
+                  disabled={deletingOptionId === currentOption.id}
+                  onClick={() => handleHostDeleteOption(currentOption)}
+                  title="Host: Remove this option from the room"
+                  className="inline-flex items-center gap-1 rounded border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] font-medium text-zinc-400 transition-colors hover:border-red-500/40 hover:text-red-400 disabled:opacity-40"
+                >
+                  <Trash2 className="h-3 w-3" />
+                  <span>Delete option</span>
+                </button>
+              )}
+            </div>
             <h2 className="text-3xl font-semibold leading-tight tracking-tight text-ink">
               {currentOption.label}
             </h2>
@@ -488,7 +738,7 @@ export default function RoomVotingPage() {
               type="button"
               disabled={isSubmittingVote}
               onClick={() => handleVoteOnCurrentCard(2)}
-              className="flex h-14 w-full items-center justify-between rounded-lg bg-accent px-5 text-black transition-opacity hover:opacity-90 active:opacity-80 disabled:opacity-60"
+              className="flex h-14 w-full items-center justify-between rounded-lg bg-[#D4FF00] px-5 text-black transition-colors hover:bg-[#c3eb00] active:opacity-80 disabled:opacity-60"
             >
               <span className="text-base font-semibold">Must Do</span>
               <span className="font-mono text-sm font-semibold tabular-nums">
@@ -525,7 +775,9 @@ export default function RoomVotingPage() {
             <button
               type="button"
               disabled={currentCardIndex === 0 || isSubmittingVote}
-              onClick={() => setCurrentCardIndex((prev) => Math.max(0, prev - 1))}
+              onClick={() =>
+                setCurrentCardIndex((prev) => Math.max(0, prev - 1))
+              }
               className="inline-flex h-11 items-center gap-1 rounded-lg px-2 text-sm font-medium text-zinc-400 transition-colors hover:text-ink disabled:opacity-30"
             >
               <ChevronLeft className="h-4 w-4" />
@@ -547,20 +799,67 @@ export default function RoomVotingPage() {
       {isNameConfirmed && hasFinishedVoting && (
         <section className="animate-fade-in space-y-4">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold tracking-tight text-ink">
-              Leaderboard
-            </h2>
-            <span className="inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wider text-zinc-500">
-              <span className="relative flex h-1.5 w-1.5">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent opacity-60" />
-                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-accent" />
+            <div className="flex items-center gap-2">
+              <h2 className="text-sm font-semibold tracking-tight text-ink">
+                Leaderboard
+              </h2>
+              <span className="inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wider text-zinc-500">
+                <span className="relative flex h-1.5 w-1.5">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent opacity-60" />
+                  <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-accent" />
+                </span>
+                Live
               </span>
-              Live
-            </span>
+            </div>
+
+            {/* Host or Tie-Breaker "Break Tie / Pick Winner" Action */}
+            {(isHost || tiedLeaders.length > 1) && (
+              <button
+                type="button"
+                onClick={handleRunTieBreakerOrPickWinner}
+                disabled={isSpinningTieBreaker}
+                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 text-xs font-medium text-ink transition-colors hover:border-zinc-500 disabled:opacity-50"
+              >
+                <Dices className="h-3.5 w-3.5 text-accent" />
+                <span>
+                  {isSpinningTieBreaker
+                    ? "Picking..."
+                    : tiedLeaders.length > 1
+                    ? "Break Tie"
+                    : syncedWinnerId
+                    ? "Re-Pick Winner"
+                    : "Decide Winner"}
+                </span>
+              </button>
+            )}
           </div>
 
-          {/* Tie-breaker */}
-          {tiedLeaders.length > 1 && (
+          {/* Synced Final Winner Reveal Banner */}
+          {decidedWinnerEntry && !isSpinningTieBreaker && (
+            <div className="animate-fade-in rounded-xl border border-accent bg-surface p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="font-mono text-[11px] font-semibold uppercase tracking-widest text-accent">
+                    Final Decision &middot; Synced to Room
+                  </div>
+                  <div className="mt-1 text-xl font-semibold tracking-tight text-ink">
+                    {decidedWinnerEntry.option.label}
+                  </div>
+                </div>
+                <div className="text-right font-mono">
+                  <div className="text-2xl font-semibold tabular-nums text-accent">
+                    {decidedWinnerEntry.totalPoints}
+                  </div>
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500">
+                    {decidedWinnerEntry.totalPoints === 1 ? "pt" : "pts"}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Tie-breaker Prompt Banner when top options are tied and no winner has been picked yet */}
+          {tiedLeaders.length > 1 && !decidedWinnerEntry && (
             <div className="rounded-xl border border-line bg-surface p-4">
               <div className="flex items-center justify-between gap-3">
                 <div>
@@ -569,7 +868,7 @@ export default function RoomVotingPage() {
                     -way tie
                   </div>
                   <p className="mt-0.5 text-sm text-zinc-300">
-                    Locked at{" "}
+                    Top options locked at{" "}
                     <span className="font-mono tabular-nums text-ink">
                       {topScore}
                     </span>{" "}
@@ -578,17 +877,15 @@ export default function RoomVotingPage() {
                 </div>
                 <button
                   type="button"
-                  onClick={handleRunTieBreaker}
+                  onClick={handleRunTieBreakerOrPickWinner}
                   disabled={isSpinningTieBreaker}
-                  className="inline-flex h-11 shrink-0 items-center gap-2 rounded-lg bg-accent px-4 text-sm font-semibold text-black transition-opacity hover:opacity-90 disabled:opacity-60"
+                  className="inline-flex h-11 shrink-0 items-center gap-2 rounded-lg bg-[#D4FF00] px-4 text-sm font-semibold text-black transition-colors hover:bg-[#c3eb00] disabled:opacity-60"
                 >
                   <Dices className="h-4 w-4" />
                   <span>
                     {isSpinningTieBreaker
                       ? "Spinning..."
-                      : tieBreakerWinnerId
-                      ? "Spin again"
-                      : "Break the tie"}
+                      : "Break Tie / Pick Winner"}
                   </span>
                 </button>
               </div>
@@ -601,9 +898,10 @@ export default function RoomVotingPage() {
               const isFirstPlace = index === 0 && entry.totalPoints > 0;
               const isTiedForFirst =
                 entry.totalPoints === topScore && topScore > 0;
-              const isTieBreakerWinner =
-                tieBreakerWinnerId === entry.option.id;
-              const highlight = isTieBreakerWinner || (isFirstPlace && !tieBreakerWinnerId);
+              const isSelectedWinner =
+                activeWinnerOptionId === entry.option.id;
+              const highlight =
+                isSelectedWinner || (isFirstPlace && !activeWinnerOptionId);
               const barPercent = Math.min(
                 100,
                 Math.round((entry.totalPoints / maxPossiblePoints) * 100)
@@ -630,19 +928,19 @@ export default function RoomVotingPage() {
                           {entry.option.label}
                         </h3>
                         <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[11px] tabular-nums text-zinc-500">
-                          {isTieBreakerWinner && (
+                          {syncedWinnerId === entry.option.id && (
                             <span className="rounded-sm bg-accent px-1.5 py-0.5 font-semibold uppercase text-black">
-                              Tie-break winner
+                              Winner
                             </span>
                           )}
-                          {!isTieBreakerWinner &&
+                          {syncedWinnerId !== entry.option.id &&
                             isFirstPlace &&
                             tiedLeaders.length === 1 && (
                               <span className="rounded-sm bg-accent px-1.5 py-0.5 font-semibold uppercase text-black">
                                 Leading
                               </span>
                             )}
-                          {!isTieBreakerWinner &&
+                          {syncedWinnerId !== entry.option.id &&
                             isTiedForFirst &&
                             tiedLeaders.length > 1 && (
                               <span className="rounded-sm border border-zinc-700 px-1.5 py-0.5 uppercase text-zinc-300">
@@ -658,16 +956,30 @@ export default function RoomVotingPage() {
                       </div>
                     </div>
 
-                    <div className="shrink-0 text-right">
-                      <div
-                        className={`font-mono text-3xl font-semibold leading-none tabular-nums tracking-tight ${
-                          highlight ? "text-accent" : "text-ink"
-                        }`}
-                      >
-                        {entry.totalPoints}
-                      </div>
-                      <div className="mt-1 font-mono text-[10px] uppercase tracking-wider text-zinc-600">
-                        {entry.totalPoints === 1 ? "pt" : "pts"}
+                    <div className="flex shrink-0 items-start gap-2.5">
+                      {isHost && options.length > 2 && (
+                        <button
+                          type="button"
+                          disabled={deletingOptionId === entry.option.id}
+                          onClick={() => handleHostDeleteOption(entry.option)}
+                          aria-label={`Remove option ${entry.option.label}`}
+                          title="Host: Delete option"
+                          className="mt-0.5 flex h-7 w-7 items-center justify-center rounded-md border border-zinc-800 text-zinc-500 transition-colors hover:border-red-500/40 hover:text-red-400 disabled:opacity-30"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      <div className="text-right">
+                        <div
+                          className={`font-mono text-3xl font-semibold leading-none tabular-nums tracking-tight ${
+                            highlight ? "text-accent" : "text-ink"
+                          }`}
+                        >
+                          {entry.totalPoints}
+                        </div>
+                        <div className="mt-1 font-mono text-[10px] uppercase tracking-wider text-zinc-600">
+                          {entry.totalPoints === 1 ? "pt" : "pts"}
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -699,7 +1011,9 @@ export default function RoomVotingPage() {
                           <span>{voter.name}</span>
                           <span
                             className={`font-mono tabular-nums ${
-                              voter.points === 2 ? "text-accent" : "text-zinc-500"
+                              voter.points === 2
+                                ? "text-accent"
+                                : "text-zinc-500"
                             }`}
                           >
                             {voter.points === 2

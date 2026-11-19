@@ -1,51 +1,40 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useMemo } from "react";
 import { useRouter } from "next/navigation";
-import { Plus, Minus, ArrowRight, Loader2 } from "lucide-react";
-import { createRoom, isSupabaseConfigured } from "@/lib/supabase";
+import { Plus, Minus, ArrowRight, Loader2, Shuffle } from "lucide-react";
+import { createRoom } from "@/lib/supabase";
+import {
+  QUICK_FILL_CATEGORIES,
+  QuickFillCategoryId,
+  detectCategoryFromTitle,
+  pickQuickFillOptions,
+} from "@/lib/quickFill";
 import { Logo } from "@/components/Logo";
-
-const QUICK_PRESETS = [
-  {
-    label: "Dinner",
-    title: "Where are we eating tonight?",
-    options: ["Street Tacos & Margaritas", "Tonkotsu Ramen", "Wood-Fired Pizza", "Thai Curry Spot"],
-  },
-  {
-    label: "Movie night",
-    title: "What are we watching?",
-    options: ["Dune: Part Two", "Everything Everywhere All at Once", "Spider-Verse", "Knives Out"],
-  },
-  {
-    label: "Game night",
-    title: "Which game are we playing first?",
-    options: ["Mario Kart 8", "Jackbox Party Pack", "Overcooked 2", "Super Smash Bros"],
-  },
-];
-
-const OPTION_PLACEHOLDERS = [
-  "e.g., Tacos El Gordo",
-  "e.g., Spicy Tonkotsu Ramen",
-  "e.g., Wood-Fired Neapolitan Pizza",
-  "e.g., Korean BBQ",
-  "e.g., Smash Burgers & Shakes",
-  "e.g., Sushi & Izakaya",
-  "e.g., Thai Street Noodles",
-  "e.g., Mediterranean Mezze",
-  "e.g., Dim Sum House",
-  "e.g., Late-Night Diner",
-];
 
 export default function HomePage() {
   const router = useRouter();
   const [title, setTitle] = useState("");
   const [options, setOptions] = useState<string[]>(["", ""]);
+  // Track which options were explicitly typed/edited by the user so Shuffle preserves them
+  const [manualOptionSet, setManualOptionSet] = useState<Set<string>>(
+    new Set()
+  );
+  const [selectedCategory, setSelectedCategory] =
+    useState<QuickFillCategoryId>("auto");
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [joinCode, setJoinCode] = useState("");
 
-  const supabaseLive = isSupabaseConfigured();
+  const detectedCategory = useMemo(
+    () => detectCategoryFromTitle(title),
+    [title]
+  );
+
+  const detectedCategoryLabel = useMemo(() => {
+    const found = QUICK_FILL_CATEGORIES.find((c) => c.id === detectedCategory);
+    return found ? found.pillLabel : "Wildcard";
+  }, [detectedCategory]);
 
   const handleOptionChange = (index: number, value: string) => {
     setError(null);
@@ -54,6 +43,14 @@ export default function HomePage() {
       next[index] = value;
       return next;
     });
+    const trimmed = value.trim();
+    if (trimmed) {
+      setManualOptionSet((prev) => {
+        const next = new Set(prev);
+        next.add(trimmed.toLowerCase());
+        return next;
+      });
+    }
   };
 
   const handleAddOption = () => {
@@ -65,13 +62,66 @@ export default function HomePage() {
   const handleRemoveOption = (index: number) => {
     if (options.length <= 2) return;
     setError(null);
-    setOptions((prev) => prev.filter((_, idx) => idx !== index));
+    setOptions((prev) => {
+      const removed = prev[index]?.trim().toLowerCase();
+      if (removed) {
+        setManualOptionSet((s) => {
+          const next = new Set(s);
+          next.delete(removed);
+          return next;
+        });
+      }
+      return prev.filter((_, idx) => idx !== index);
+    });
   };
 
-  const applyPreset = (preset: (typeof QUICK_PRESETS)[number]) => {
+  const handleShuffleQuickFill = (
+    overrideCategory?: QuickFillCategoryId
+  ) => {
     setError(null);
-    setTitle(preset.title);
-    setOptions([...preset.options]);
+    const activeCat = overrideCategory ?? selectedCategory;
+
+    // Collect all current non-empty options in the room so none of them are duplicated
+    const currentNonEmpty = options.map((o) => o.trim()).filter(Boolean);
+
+    // Keep any options the user manually typed
+    const preservedManual = currentNonEmpty.filter((opt) =>
+      manualOptionSet.has(opt.toLowerCase())
+    );
+
+    const slotsAvailable = Math.max(0, 10 - preservedManual.length);
+    const pickCount = Math.min(4, slotsAvailable);
+
+    const { resolvedCategory, options: picked } = pickQuickFillOptions({
+      category: activeCat,
+      roomTitle: title,
+      existingOptions: currentNonEmpty,
+      count: pickCount,
+    });
+
+    const nextOptions = [...preservedManual, ...picked];
+    while (nextOptions.length < 2) {
+      nextOptions.push("");
+    }
+
+    setOptions(nextOptions.slice(0, 10));
+
+    // If the user hasn't typed a title yet, fill a clean matching question
+    if (!title.trim()) {
+      const meta = QUICK_FILL_CATEGORIES.find((c) => c.id === resolvedCategory);
+      if (meta) {
+        setTitle(meta.defaultTitle);
+      }
+    }
+  };
+
+  const handleSelectCategoryPill = (catId: QuickFillCategoryId) => {
+    setSelectedCategory(catId);
+    // If all current options are still blank, immediately populate 4 shuffled options
+    const hasAnyOption = options.some((o) => o.trim().length > 0);
+    if (!hasAnyOption && catId !== "auto") {
+      handleShuffleQuickFill(catId);
+    }
   };
 
   const handleCreateRoom = async (e: React.FormEvent) => {
@@ -80,7 +130,7 @@ export default function HomePage() {
 
     const cleanTitle = title.trim();
     if (!cleanTitle) {
-      setError("Enter a room title, e.g. \"Where are we eating?\"");
+      setError('Enter a room title, e.g. "Where are we eating?"');
       return;
     }
 
@@ -119,24 +169,9 @@ export default function HomePage() {
 
   return (
     <main className="mx-auto flex w-full max-w-md flex-1 flex-col px-4 pb-8 pt-4 sm:pt-8">
-      {/* Top bar */}
+      {/* Clean Consumer Top Bar (No developer DB status clutter) */}
       <header className="mb-5 flex h-9 items-center justify-between">
         <Logo />
-        <span
-          title={
-            supabaseLive
-              ? "Connected to Supabase via .env.local"
-              : "Running on local storage. Add Supabase keys to .env.local for the cloud database."
-          }
-          className="inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wider text-zinc-500"
-        >
-          <span
-            className={`h-1.5 w-1.5 rounded-full ${
-              supabaseLive ? "bg-accent" : "bg-zinc-600"
-            }`}
-          />
-          {supabaseLive ? "Supabase" : "Local"}
-        </span>
       </header>
 
       {/* Hero */}
@@ -158,23 +193,6 @@ export default function HomePage() {
           <span className="font-mono text-xs tabular-nums text-zinc-500">
             {options.length} / 10
           </span>
-        </div>
-
-        {/* Quick fill */}
-        <div className="no-scrollbar -mx-1 mb-4 flex gap-2 overflow-x-auto px-1">
-          <span className="flex shrink-0 items-center font-mono text-[11px] uppercase tracking-wider text-zinc-600">
-            Quick fill
-          </span>
-          {QUICK_PRESETS.map((preset) => (
-            <button
-              key={preset.label}
-              type="button"
-              onClick={() => applyPreset(preset)}
-              className="shrink-0 rounded-full border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-zinc-600 hover:text-ink"
-            >
-              {preset.label}
-            </button>
-          ))}
         </div>
 
         <form onSubmit={handleCreateRoom} className="space-y-4">
@@ -201,6 +219,51 @@ export default function HomePage() {
             />
           </div>
 
+          {/* Smart Randomized Quick-Fill Engine Controls */}
+          <div className="rounded-lg border border-zinc-800/80 bg-zinc-950/60 p-3">
+            <div className="mb-2.5 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono text-[11px] uppercase tracking-wider text-zinc-400">
+                  Smart Quick-Fill
+                </span>
+                {selectedCategory === "auto" && title.trim().length > 0 && (
+                  <span className="rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">
+                    {detectedCategoryLabel}
+                  </span>
+                )}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => handleShuffleQuickFill()}
+                className="inline-flex h-7 items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 text-xs font-medium text-ink transition-colors hover:border-zinc-500 hover:bg-zinc-800 active:opacity-80"
+              >
+                <Shuffle className="h-3.5 w-3.5" />
+                <span>Shuffle Quick-Fill</span>
+              </button>
+            </div>
+
+            <div className="no-scrollbar -mx-1 flex gap-1.5 overflow-x-auto px-1">
+              {QUICK_FILL_CATEGORIES.map((cat) => {
+                const isActive = selectedCategory === cat.id;
+                return (
+                  <button
+                    key={cat.id}
+                    type="button"
+                    onClick={() => handleSelectCategoryPill(cat.id)}
+                    className={`shrink-0 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors ${
+                      isActive
+                        ? "border-zinc-400 bg-zinc-800 text-white"
+                        : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600 hover:text-ink"
+                    }`}
+                  >
+                    {cat.pillLabel}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           {/* Options */}
           <div>
             <div className="mb-1.5 flex items-center justify-between">
@@ -214,7 +277,10 @@ export default function HomePage() {
 
             <div className="space-y-2">
               {options.map((option, index) => (
-                <div key={index} className="flex items-center gap-2 animate-fade-in">
+                <div
+                  key={index}
+                  className="flex items-center gap-2 animate-fade-in"
+                >
                   <span className="w-6 shrink-0 text-center font-mono text-xs tabular-nums text-zinc-600">
                     {String(index + 1).padStart(2, "0")}
                   </span>
@@ -223,7 +289,7 @@ export default function HomePage() {
                     value={option}
                     maxLength={80}
                     onChange={(e) => handleOptionChange(index, e.target.value)}
-                    placeholder={OPTION_PLACEHOLDERS[index] || `Option ${index + 1}`}
+                    placeholder={`Option ${index + 1}`}
                     aria-label={`Option ${index + 1}`}
                     className="h-11 min-w-0 flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 text-[15px] text-white outline-none transition-colors placeholder:text-zinc-500 focus:border-zinc-500"
                   />

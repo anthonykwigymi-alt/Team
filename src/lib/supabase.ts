@@ -1,8 +1,7 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
-// Supabase now issues "publishable" keys (sb_publishable_...) in place of the
-// legacy anon JWT. Accept either env var name. Each must be referenced literally
-// so Next.js can inline it into the client bundle.
+// Supabase issues "publishable" keys (sb_publishable_...) as well as legacy anon JWTs.
+// Reference env vars literally so Next.js inlines them into the client bundle.
 function readSupabaseUrl(): string {
   return (process.env.NEXT_PUBLIC_SUPABASE_URL || "").trim();
 }
@@ -15,17 +14,20 @@ function readSupabaseKey(): string {
   ).trim();
 }
 
-const supabaseUrl = readSupabaseUrl() || "https://placeholder-project.supabase.co";
+const supabaseUrl =
+  readSupabaseUrl() || "https://placeholder-project.supabase.co";
 const supabaseAnonKey = readSupabaseKey() || "placeholder-anon-key";
 
-export const supabase: SupabaseClient = createClient(supabaseUrl, supabaseAnonKey);
+export const supabase: SupabaseClient = createClient(
+  supabaseUrl,
+  supabaseAnonKey
+);
 
 export function isSupabaseConfigured(): boolean {
   const url = readSupabaseUrl();
   const key = readSupabaseKey();
   const isValidKey =
-    key.startsWith("sb_publishable_") || // new publishable key format
-    key.startsWith("eyJ"); // legacy anon JWT format
+    key.startsWith("sb_publishable_") || key.startsWith("eyJ");
   return (
     Boolean(url) &&
     Boolean(key) &&
@@ -68,10 +70,24 @@ export interface RoomBundle {
   room: Room;
   options: RoomOption[];
   votes: Vote[];
+  winnerOptionId: string | null;
   mode: "supabase" | "local";
 }
 
+// Sentinel voter names stored inside `public.votes` (with points = 0) so winner reveal
+// and host option cleanup persist & broadcast via Realtime even on V1 database schemas.
+export const SYSTEM_WINNER_VOTER = "__SYSTEM_WINNER__";
+export const SYSTEM_DELETED_OPTION_VOTER = "__SYSTEM_DELETED_OPTION__";
+
+export function isSystemVote(vote: Vote): boolean {
+  return (
+    vote.voter_name === SYSTEM_WINNER_VOTER ||
+    vote.voter_name === SYSTEM_DELETED_OPTION_VOTER
+  );
+}
+
 const LOCAL_STORAGE_ROOMS_KEY = "decide_for_us_local_rooms_v1";
+const HOSTED_ROOMS_STORAGE_KEY = "decide_for_us_hosted_rooms_v1";
 const BROADCAST_CHANNEL_NAME = "decide_for_us_realtime_channel";
 
 interface LocalStore {
@@ -101,11 +117,48 @@ function writeLocalStore(store: LocalStore) {
     window.localStorage.setItem(LOCAL_STORAGE_ROOMS_KEY, JSON.stringify(store));
     if ("BroadcastChannel" in window) {
       const bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
-      bc.postMessage({ type: "VOTES_UPDATED", timestamp: Date.now() });
+      bc.postMessage({ type: "ROOM_UPDATED", timestamp: Date.now() });
       bc.close();
     }
   } catch {
     // Ignore storage quota errors
+  }
+}
+
+/**
+ * Remembers in localStorage that the current browser created a room code.
+ */
+export function rememberHostForRoom(code: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    const clean = code.trim().toUpperCase();
+    const existingRaw = window.localStorage.getItem(HOSTED_ROOMS_STORAGE_KEY);
+    const list: string[] = existingRaw ? JSON.parse(existingRaw) : [];
+    if (!list.includes(clean)) {
+      list.push(clean);
+      window.localStorage.setItem(
+        HOSTED_ROOMS_STORAGE_KEY,
+        JSON.stringify(list)
+      );
+    }
+  } catch {
+    // Ignore localStorage errors
+  }
+}
+
+/**
+ * Checks whether the current browser is the host/creator of the specified room code.
+ */
+export function isHostForRoom(code: string): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const clean = code.trim().toUpperCase();
+    const existingRaw = window.localStorage.getItem(HOSTED_ROOMS_STORAGE_KEY);
+    if (!existingRaw) return false;
+    const list: string[] = JSON.parse(existingRaw);
+    return Array.isArray(list) && list.includes(clean);
+  } catch {
+    return false;
   }
 }
 
@@ -121,7 +174,7 @@ function makeUuid(): string {
 }
 
 /**
- * Generates a short random 6-character uppercase room code (excluding ambiguous characters)
+ * Generates a short random 6-character uppercase room code (excluding ambiguous characters).
  */
 export function generateRoomCode(): string {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -134,7 +187,57 @@ export function generateRoomCode(): string {
 }
 
 /**
- * Creates a room and its options in Supabase (with automatic local fallback if Supabase isn't connected yet)
+ * Filters raw options and votes to apply synced option deletions and extract the synced winner option ID.
+ */
+export function normalizeRoomState(
+  rawOptions: RoomOption[],
+  rawVotes: Vote[]
+): {
+  options: RoomOption[];
+  votes: Vote[];
+  winnerOptionId: string | null;
+} {
+  const deletedOptionIds = new Set<string>();
+  let winnerVote: Vote | null = null;
+
+  for (const v of rawVotes) {
+    if (v.voter_name === SYSTEM_DELETED_OPTION_VOTER) {
+      deletedOptionIds.add(v.option_id);
+    } else if (v.voter_name === SYSTEM_WINNER_VOTER) {
+      if (
+        !winnerVote ||
+        new Date(v.created_at).getTime() >=
+          new Date(winnerVote.created_at).getTime()
+      ) {
+        winnerVote = v;
+      }
+    }
+  }
+
+  const activeOptions = rawOptions.filter(
+    (opt) => !deletedOptionIds.has(opt.id)
+  );
+  const activeOptionIdSet = new Set(activeOptions.map((o) => o.id));
+
+  const userVotes = rawVotes.filter(
+    (v) => !isSystemVote(v) && activeOptionIdSet.has(v.option_id)
+  );
+
+  const winnerOptionId =
+    winnerVote && activeOptionIdSet.has(winnerVote.option_id)
+      ? winnerVote.option_id
+      : null;
+
+  return {
+    options: activeOptions,
+    votes: userVotes,
+    winnerOptionId,
+  };
+}
+
+/**
+ * Creates a room and its options in Supabase (with automatic local fallback)
+ * and marks the current user as the room host in localStorage.
  */
 export async function createRoom(
   title: string,
@@ -144,6 +247,8 @@ export async function createRoom(
   const cleanOptions = optionLabels.map((o) => o.trim()).filter(Boolean);
   const code = generateRoomCode();
   const now = new Date().toISOString();
+
+  rememberHostForRoom(code);
 
   if (isSupabaseConfigured()) {
     try {
@@ -172,10 +277,10 @@ export async function createRoom(
         throw optionsError;
       }
 
-      // Mirror to local store as cache
       const store = readLocalStore();
       store.rooms[code] = roomData as Room;
-      store.optionsByRoomId[roomData.id] = (insertedOptions || []) as RoomOption[];
+      store.optionsByRoomId[roomData.id] = (insertedOptions ||
+        []) as RoomOption[];
       store.votesByRoomId[roomData.id] = [];
       writeLocalStore(store);
 
@@ -188,7 +293,6 @@ export async function createRoom(
     }
   }
 
-  // Fallback local persistence so app works out-of-the-box before .env.local is populated
   const roomId = makeUuid();
   const room: Room = {
     id: roomId,
@@ -214,7 +318,7 @@ export async function createRoom(
 }
 
 /**
- * Loads a room, its options, and all current votes by 6-character room code.
+ * Loads a room, its options, all current user votes, and any synced winner decision by 6-char room code.
  */
 export async function getRoomBundleByCode(
   rawCode: string
@@ -230,25 +334,32 @@ export async function getRoomBundleByCode(
         .single();
 
       if (!roomError && roomData) {
-        const [{ data: optionsData, error: optionsError }, { data: votesData, error: votesError }] =
-          await Promise.all([
-            supabase
-              .from("options")
-              .select("*")
-              .eq("room_id", roomData.id)
-              .order("position", { ascending: true }),
-            supabase
-              .from("votes")
-              .select("*")
-              .eq("room_id", roomData.id)
-              .order("created_at", { ascending: true }),
-          ]);
+        const [
+          { data: optionsData, error: optionsError },
+          { data: votesData, error: votesError },
+        ] = await Promise.all([
+          supabase
+            .from("options")
+            .select("*")
+            .eq("room_id", roomData.id)
+            .order("position", { ascending: true }),
+          supabase
+            .from("votes")
+            .select("*")
+            .eq("room_id", roomData.id)
+            .order("created_at", { ascending: true }),
+        ]);
 
         if (!optionsError && !votesError) {
+          const normalized = normalizeRoomState(
+            (optionsData || []) as RoomOption[],
+            (votesData || []) as Vote[]
+          );
           return {
             room: roomData as Room,
-            options: (optionsData || []) as RoomOption[],
-            votes: (votesData || []) as Vote[],
+            options: normalized.options,
+            votes: normalized.votes,
+            winnerOptionId: normalized.winnerOptionId,
             mode: "supabase",
           };
         }
@@ -258,42 +369,67 @@ export async function getRoomBundleByCode(
     }
   }
 
-  // Check local fallback store
   const store = readLocalStore();
   const localRoom = store.rooms[code];
   if (!localRoom) {
     return null;
   }
 
+  const normalized = normalizeRoomState(
+    store.optionsByRoomId[localRoom.id] || [],
+    store.votesByRoomId[localRoom.id] || []
+  );
+
   return {
     room: localRoom,
-    options: store.optionsByRoomId[localRoom.id] || [],
-    votes: store.votesByRoomId[localRoom.id] || [],
+    options: normalized.options,
+    votes: normalized.votes,
+    winnerOptionId: normalized.winnerOptionId,
     mode: "local",
   };
 }
 
 /**
- * Fetches latest votes for a given room ID.
+ * Fetches latest options, votes, and synced winner for a given room ID.
  */
-export async function fetchVotesForRoom(
+export async function fetchRoomLiveState(
   roomId: string,
   mode: "supabase" | "local"
-): Promise<Vote[]> {
+): Promise<{
+  options: RoomOption[];
+  votes: Vote[];
+  winnerOptionId: string | null;
+} | null> {
   if (mode === "supabase" && isSupabaseConfigured()) {
-    const { data, error } = await supabase
-      .from("votes")
-      .select("*")
-      .eq("room_id", roomId)
-      .order("created_at", { ascending: true });
+    const [
+      { data: optionsData, error: optionsError },
+      { data: votesData, error: votesError },
+    ] = await Promise.all([
+      supabase
+        .from("options")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("position", { ascending: true }),
+      supabase
+        .from("votes")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: true }),
+    ]);
 
-    if (!error && data) {
-      return data as Vote[];
+    if (!optionsError && !votesError && optionsData && votesData) {
+      return normalizeRoomState(
+        optionsData as RoomOption[],
+        votesData as Vote[]
+      );
     }
   }
 
   const store = readLocalStore();
-  return store.votesByRoomId[roomId] || [];
+  return normalizeRoomState(
+    store.optionsByRoomId[roomId] || [],
+    store.votesByRoomId[roomId] || []
+  );
 }
 
 /**
@@ -312,7 +448,6 @@ export async function castOptionVote(params: {
 
   if (mode === "supabase" && isSupabaseConfigured()) {
     try {
-      // Check if voter already voted on this option in this room so re-voting updates cleanly
       const { data: existing } = await supabase
         .from("votes")
         .select("id")
@@ -355,7 +490,6 @@ export async function castOptionVote(params: {
     }
   }
 
-  // Local store upsert
   const store = readLocalStore();
   const existingVotes = store.votesByRoomId[roomId] || [];
   const existingIdx = existingVotes.findIndex(
@@ -390,18 +524,116 @@ export async function castOptionVote(params: {
 }
 
 /**
- * Subscribes to realtime vote changes for a room via Supabase Realtime + local BroadcastChannel.
+ * Persists and broadcasts the winning option ID (from a tie-breaker or host "Decide Winner" action)
+ * so every connected device sees the exact same final decision.
+ */
+export async function persistRoomWinner(params: {
+  roomId: string;
+  optionId: string;
+  mode: "supabase" | "local";
+}): Promise<void> {
+  const { roomId, optionId, mode } = params;
+  const now = new Date().toISOString();
+
+  if (mode === "supabase" && isSupabaseConfigured()) {
+    try {
+      const { data: existing } = await supabase
+        .from("votes")
+        .select("id")
+        .eq("room_id", roomId)
+        .eq("voter_name", SYSTEM_WINNER_VOTER)
+        .maybeSingle();
+
+      if (existing?.id) {
+        await supabase
+          .from("votes")
+          .update({ option_id: optionId, points: 0 })
+          .eq("id", existing.id);
+      } else {
+        await supabase.from("votes").insert({
+          room_id: roomId,
+          option_id: optionId,
+          voter_name: SYSTEM_WINNER_VOTER,
+          points: 0,
+        });
+      }
+    } catch (err) {
+      console.warn("Failed to persist winner in Supabase:", err);
+    }
+  }
+
+  const store = readLocalStore();
+  const existingVotes = (store.votesByRoomId[roomId] || []).filter(
+    (v) => v.voter_name !== SYSTEM_WINNER_VOTER
+  );
+  existingVotes.push({
+    id: makeUuid(),
+    room_id: roomId,
+    option_id: optionId,
+    voter_name: SYSTEM_WINNER_VOTER,
+    points: 0,
+    created_at: now,
+  });
+  store.votesByRoomId[roomId] = existingVotes;
+  writeLocalStore(store);
+}
+
+/**
+ * Host Option Cleanup: deletes a typo/spam option from the room and syncs across all devices.
+ */
+export async function deleteRoomOption(params: {
+  roomId: string;
+  optionId: string;
+  mode: "supabase" | "local";
+}): Promise<void> {
+  const { roomId, optionId, mode } = params;
+  const now = new Date().toISOString();
+
+  if (mode === "supabase" && isSupabaseConfigured()) {
+    try {
+      // 1. Record a deletion sentinel in `votes` first so even if the database hasn't
+      // applied a DELETE policy on `options`, all connected devices immediately hide the option.
+      await supabase.from("votes").insert({
+        room_id: roomId,
+        option_id: optionId,
+        voter_name: SYSTEM_DELETED_OPTION_VOTER,
+        points: 0,
+      });
+
+      // 2. Also attempt physical deletion from `options` (cascades votes if DELETE RLS is active).
+      await supabase.from("options").delete().eq("id", optionId);
+    } catch (err) {
+      console.warn("Supabase option delete fallback:", err);
+    }
+  }
+
+  const store = readLocalStore();
+  if (store.optionsByRoomId[roomId]) {
+    store.optionsByRoomId[roomId] = store.optionsByRoomId[roomId].filter(
+      (o) => o.id !== optionId
+    );
+  }
+  if (store.votesByRoomId[roomId]) {
+    store.votesByRoomId[roomId] = store.votesByRoomId[roomId].filter(
+      (v) => v.option_id !== optionId
+    );
+  }
+  writeLocalStore(store);
+}
+
+/**
+ * Subscribes to realtime changes for a room (votes, options, winner decisions)
+ * via Supabase Realtime + local BroadcastChannel.
  */
 export function subscribeToRoomRealtime(
   roomId: string,
-  onVotesChanged: () => void
+  onRoomChanged: () => void
 ): () => void {
   const cleanups: Array<() => void> = [];
 
-  // 1. Supabase Realtime subscription on public.votes
   if (isSupabaseConfigured()) {
     const channel = supabase
-      .channel(`room-votes-${roomId}`)
+      .channel(`room-live-${roomId}`)
       .on(
         "postgres_changes",
         {
@@ -411,7 +643,19 @@ export function subscribeToRoomRealtime(
           filter: `room_id=eq.${roomId}`,
         },
         () => {
-          onVotesChanged();
+          onRoomChanged();
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "options",
+          filter: `room_id=eq.${roomId}`,
+        },
+        () => {
+          onRoomChanged();
         }
       )
       .subscribe();
@@ -421,11 +665,10 @@ export function subscribeToRoomRealtime(
     });
   }
 
-  // 2. Cross-tab BroadcastChannel & storage listener for instant local updates
   if (typeof window !== "undefined") {
     if ("BroadcastChannel" in window) {
       const bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
-      const handler = () => onVotesChanged();
+      const handler = () => onRoomChanged();
       bc.addEventListener("message", handler);
       cleanups.push(() => {
         bc.removeEventListener("message", handler);
@@ -435,7 +678,7 @@ export function subscribeToRoomRealtime(
 
     const storageHandler = (e: StorageEvent) => {
       if (e.key === LOCAL_STORAGE_ROOMS_KEY) {
-        onVotesChanged();
+        onRoomChanged();
       }
     };
     window.addEventListener("storage", storageHandler);

@@ -1,37 +1,38 @@
-# Decide For Us - Architecture & AI Editing Rules (.cursorrules)
+# Decide For Us (V2) - Architecture & AI Editing Rules (.cursorrules)
 
 ## Project Overview
 "Decide For Us" is a fast, mobile-first, no-login-required group decision and tie-breaker web application built with:
 - **Framework**: Next.js (App Router) with TypeScript
-- **Styling**: Tailwind CSS (Dark-mode first, sleek mobile-first UI, large tap-friendly targets)
+- **Styling**: Tailwind CSS (Swiss-minimalist dark UI, large tap-friendly targets)
 - **Icons**: `lucide-react`
-- **Backend & Realtime**: Supabase (`@supabase/supabase-js`) configured via `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` in `.env.local`.
+- **Backend & Realtime**: Supabase (`@supabase/supabase-js`) configured via `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` (or `NEXT_PUBLIC_SUPABASE_ANON_KEY`) in `.env.local`.
 
-## Core Routes & Invariants (NEVER BREAK EXISTING WORKING ROUTES)
+## Core Routes & Modules (NEVER BREAK EXISTING WORKING ROUTES)
 1. **Home Page (`src/app/page.tsx` -> `/`)**:
-   - Displays the hero section and the "Create a Room" interactive card.
-   - Allows entering a Room Title and dynamically managing between 2 and 10 options (`+ Add Option` and remove option buttons).
-   - Generates a random 6-character alphanumeric room code, persists the room and options to Supabase (`rooms` and `options` tables), and redirects to `/room/[code]`.
-   - **Rule**: Never break the room creation flow, option validation (2–10 options), or the redirect to `/room/[code]`.
+   - Displays a clean consumer header (no developer DB badges), hero section, and the "Create a Room" card.
+   - Integrates the Smart Randomized Quick-Fill Engine (`src/lib/quickFill.ts`) with category pills (`Auto-Detect`, `Food`, `Watch`, `Play`, `Hangout`, `Wildcard`) and a "Shuffle Quick-Fill" button using a true Fisher-Yates shuffle that excludes options already in the room.
+   - Allows entering a Room Title and dynamically managing between 2 and 10 options.
+   - Generates a random 6-character alphanumeric room code, remembers the room host in `localStorage`, saves the room and options to Supabase (`rooms` and `options` tables), and redirects to `/room/[code]`.
 
 2. **Room & Voting Page (`src/app/room/[code]/page.tsx` -> `/room/[code]`)**:
-   - Includes a "Copy Invite Link" button at the top.
+   - Includes a mobile-aware "Share Invite" button (`navigator.share` on mobile, clipboard + toast on desktop) and an inline SVG QR Code modal (`src/lib/qrCode.ts`).
    - Prompts visitors for a Display Name before voting and persists it in `localStorage` (`decide_for_us_display_name`).
    - Provides a card-by-card voting UI for each option with three point tiers:
      - "Pass" (`0` points)
      - "Down" (`+1` point)
      - "Must Do" (`+2` points)
-   - Transitions upon completion to the **Live Leaderboard** sorted descending by total points, kept in sync in real time via Supabase Realtime (`postgres_changes` on `public.votes`).
-   - **Rule**: Never break `/room/[code]` routing, `localStorage` display name handling, card-by-card voting submission, or the Supabase Realtime subscription.
+   - Allows the room host (`localStorage`) to delete typo/spam options from the room (`deleteRoomOption`).
+   - Transitions upon completion to the **Live Leaderboard** sorted descending by total points, kept in sync in real time via Supabase Realtime (`postgres_changes` on `public.votes` and `public.options`).
+   - Provides a synced **Break Tie / Pick Winner** roulette action that persists the winning option (`persistRoomWinner`) so every connected device sees the exact same final decision.
 
 ## Database Schema Contract (`schema.sql`)
 - `public.rooms`: `id (uuid)`, `code (varchar(6), unique)`, `title (text)`, `created_at (timestamptz)`
 - `public.options`: `id (uuid)`, `room_id (uuid -> rooms.id)`, `label (text)`, `position (int)`, `created_at (timestamptz)`
 - `public.votes`: `id (uuid)`, `room_id (uuid -> rooms.id)`, `option_id (uuid -> options.id)`, `voter_name (text)`, `points (int: 0, 1, 2)`, `created_at (timestamptz)`
-- All three tables rely on public anonymous `SELECT` and `INSERT` RLS policies so users never need to log in.
+- All three tables rely on public anonymous RLS policies so users never need to log in.
 
 ## Guidelines for Future AI Edits
 1. **Preserve Working Routes**: Do not rename, remove, or break `/` or `/room/[code]`. Always verify route params and client/server component boundaries.
 2. **Maintain the Swiss-minimal Dark UI**: Use the Tailwind tokens `canvas` (#09090B), `surface` (#111113), `line` (#27272A), `ink` (#FAFAFA) and the single accent `accent` (#D4FF00, always with black text). No gradients, blurred glows, emojis, or extra accent colors. Use `font-mono tabular-nums` for room codes, counters (`2 / 10`) and points. Keep tap targets at least 44px tall and keep the Create Room CTA above the fold on mobile.
-3. **Environment Variables**: Always read `process.env.NEXT_PUBLIC_SUPABASE_URL` and `process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY` via `@supabase/supabase-js`. Do not introduce mandatory auth walls.
+3. **Environment Variables**: Always read `process.env.NEXT_PUBLIC_SUPABASE_URL` and `process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` / `process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY` via `@supabase/supabase-js`. Do not introduce mandatory auth walls.
 4. **Type Safety**: Keep TypeScript interfaces in `src/lib/supabase.ts` aligned with `schema.sql`.

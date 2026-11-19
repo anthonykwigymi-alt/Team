@@ -1,5 +1,5 @@
 -- ============================================================================
--- Decide For Us - Supabase Database Schema & RLS Policies
+-- Decide For Us (V2) - Supabase Database Schema & RLS Policies
 -- Fast, no-login-required group decision and tie-breaker tool
 -- ============================================================================
 
@@ -43,8 +43,8 @@ CREATE INDEX IF NOT EXISTS idx_votes_option_id ON public.votes (option_id);
 
 -- ============================================================================
 -- ROW LEVEL SECURITY (RLS) POLICIES
--- Enable public anonymous read/insert access so anyone with a room link
--- can create rooms, view options, and cast votes without logging in.
+-- Enable public anonymous access so anyone with a room link can create rooms,
+-- view/manage options, and cast votes without logging in.
 -- ============================================================================
 
 ALTER TABLE public.rooms ENABLE ROW LEVEL SECURITY;
@@ -66,7 +66,7 @@ CREATE POLICY "Allow public insert access on rooms"
   TO public
   WITH CHECK (true);
 
--- Options policies: Public Read & Public Insert
+-- Options policies: Public Read, Public Insert, Public Delete (Host Option Cleanup)
 DROP POLICY IF EXISTS "Allow public read access on options" ON public.options;
 CREATE POLICY "Allow public read access on options"
   ON public.options
@@ -81,7 +81,14 @@ CREATE POLICY "Allow public insert access on options"
   TO public
   WITH CHECK (true);
 
--- Votes policies: Public Read, Public Insert, Public Update
+DROP POLICY IF EXISTS "Allow public delete access on options" ON public.options;
+CREATE POLICY "Allow public delete access on options"
+  ON public.options
+  FOR DELETE
+  TO public
+  USING (true);
+
+-- Votes policies: Public Read, Public Insert, Public Update, Public Delete
 DROP POLICY IF EXISTS "Allow public read access on votes" ON public.votes;
 CREATE POLICY "Allow public read access on votes"
   ON public.votes
@@ -104,10 +111,17 @@ CREATE POLICY "Allow public update access on votes"
   USING (true)
   WITH CHECK (true);
 
+DROP POLICY IF EXISTS "Allow public delete access on votes" ON public.votes;
+CREATE POLICY "Allow public delete access on votes"
+  ON public.votes
+  FOR DELETE
+  TO public
+  USING (true);
+
 -- ============================================================================
 -- SUPABASE REALTIME CONFIGURATION
--- Broadcast changes on votes (and options) so the Live Leaderboard updates
--- instantaneously for all participants in a room.
+-- Broadcast changes on votes and options so the Live Leaderboard and
+-- host cleanup / tie-breaker decisions sync instantaneously across all devices.
 -- ============================================================================
 
 DO $$
